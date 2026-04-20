@@ -147,6 +147,8 @@ The timing pipeline supports a `madmom`-first path, but local experiments showed
 
 This repository assumes that raw Beat Saber content has already been processed by the `harveyliao/beat-weaver` fork.
 
+- [related section](https://github.com/harveyliao/beat-weaver#prepare-data-here-train-in-muq-beat-weaver)
+
 Typical division of responsibility:
 
 - `harveyliao/beat-weaver`: process raw Beat Saber maps and build `audio_manifest.json`
