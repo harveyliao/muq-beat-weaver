@@ -1,0 +1,1156 @@
+﻿"""PyTorch Dataset for Beat Saber map training.
+
+Produces (mel_spectrogram, token_ids, token_mask) tuples from Parquet data + audio.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, WeightedRandomSampler
+
+from muq_beat_weaver.model.audio import (
+    beat_align_spectrogram,
+    compute_mel_spectrogram,
+    compute_mel_with_onset,
+    interpolate_muq_to_beat_grid,
+    load_audio,
+    load_manifest,
+)
+from muq_beat_weaver.model.parquet import read_notes_parquet
+from muq_beat_weaver.model.timing import (
+    load_metadata_dict,
+    load_timing_metadata,
+    rebase_note_dicts_to_timing,
+)
+
+_MUQ_FEATURE_DIM = 1024
+from muq_beat_weaver.model.config import ModelConfig
+from muq_beat_weaver.model.tokenizer import encode_beatmap
+from muq_beat_weaver.schemas.normalized import (
+    DifficultyInfo,
+    Note,
+    NormalizedBeatmap,
+    SongMetadata,
+)
+
+logger = logging.getLogger(__name__)
+_DATASET_CACHE_VERSION = "5"
+_MUQ_ENCODER_TYPES = {"muq", "muq_precomputed"}
+_MUQ_RAW_CACHE_DIRNAME = "muq_cache"
+_MUQ_BEATGRID_CACHE_DIRNAME = "muq_cache_beatgrid"
+_FRAMES_PER_BEAT_SUBDIVISION = 1
+_SUBDIVISIONS_PER_BEAT = 16
+_SUBDIVISIONS_PER_BAR = 64
+
+
+@dataclass(slots=True)
+class _PreparedDatasetCorpus:
+    """Shared dataset state reused across train/val/test views."""
+
+    audio_manifest: dict[str, str]
+    metadata: dict[str, dict]
+    timing: dict[str, dict]
+    mel_cache_dir: Path
+    samples: list[dict]
+    split_hashes: dict[str, set[str]]
+
+
+def _resolve_feature_cache_dir(processed_dir: Path, config: ModelConfig) -> Path:
+    processed_dir = Path(processed_dir)
+    if config.encoder_type not in _MUQ_ENCODER_TYPES:
+        return processed_dir / "mel_cache"
+
+    beatgrid_dir = processed_dir / _MUQ_BEATGRID_CACHE_DIRNAME
+    raw_dir = processed_dir / _MUQ_RAW_CACHE_DIRNAME
+    if beatgrid_dir.exists() and ((beatgrid_dir / "VERSION").exists() or any(beatgrid_dir.glob("*.npy"))):
+        return beatgrid_dir
+    return raw_dir
+
+
+def _is_beatgrid_muq_cache(cache_dir: Path) -> bool:
+    return Path(cache_dir).name == _MUQ_BEATGRID_CACHE_DIRNAME
+
+
+def _compute_one_mel(
+    audio_path: str, song_hash: str, bpm: float, cache_path: str,
+    sr: int, n_mels: int, n_fft: int, hop_length: int,
+    use_onset: bool = False,
+) -> str | None:
+    """Compute and cache one mel spectrogram. Returns song_hash on success, None on error."""
+    try:
+        audio, actual_sr = load_audio(Path(audio_path), sr=sr)
+        if use_onset:
+            mel = compute_mel_with_onset(
+                audio, sr=actual_sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length,
+            )
+        else:
+            mel = compute_mel_spectrogram(
+                audio, sr=actual_sr, n_mels=n_mels, n_fft=n_fft, hop_length=hop_length,
+            )
+        mel = beat_align_spectrogram(mel, sr=actual_sr, hop_length=hop_length, bpm=bpm)
+        np.save(cache_path, mel)
+        return song_hash
+    except Exception as e:
+        logger.warning("Failed to compute mel for %s: %s", song_hash, e)
+        return None
+
+
+def _cache_version_key(config: ModelConfig) -> str:
+    """Compute a version string from feature-relevant config fields."""
+    import hashlib
+    key = f"{config.n_mels}_{config.n_fft}_{config.hop_length}_{config.sample_rate}_{config.use_onset_features}"
+    return hashlib.md5(key.encode()).hexdigest()[:12]
+
+
+def warm_mel_cache(
+    processed_dir: Path,
+    audio_manifest_path: Path,
+    config: ModelConfig,
+    max_workers: int | None = None,
+) -> int:
+    """Pre-compute mel spectrograms in parallel for all songs in the manifest.
+
+    Skips songs that already have a cached mel file. Returns the number of
+    newly computed spectrograms.
+    """
+    cache_dir = processed_dir / "mel_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check cache version 鈥?invalidate if feature config changed
+    version_file = cache_dir / "VERSION"
+    expected_version = _cache_version_key(config)
+    needs_clear = False
+    if version_file.exists():
+        current_version = version_file.read_text(encoding="utf-8").strip()
+        if current_version != expected_version:
+            needs_clear = True
+    else:
+        # No VERSION file but cache files exist 鈥?legacy cache, must clear
+        if any(cache_dir.glob("*.npy")):
+            needs_clear = True
+    if needs_clear:
+        n_stale = sum(1 for _ in cache_dir.glob("*.npy"))
+        logger.warning(
+            "Mel cache version mismatch (need %s). "
+            "Clearing %d stale files and recomputing.",
+            expected_version, n_stale,
+        )
+        for npy_file in cache_dir.glob("*.npy"):
+            npy_file.unlink()
+    version_file.write_text(expected_version, encoding="utf-8")
+
+    manifest = load_manifest(audio_manifest_path)
+
+    # Load BPMs from metadata
+    raw_meta = json.loads((processed_dir / "metadata.json").read_text(encoding="utf-8"))
+    bpm_lookup: dict[str, float] = {}
+    if isinstance(raw_meta, list):
+        for m in raw_meta:
+            bpm_lookup[m["hash"]] = m["bpm"]
+    else:
+        for h, m in raw_meta.items():
+            bpm_lookup[h] = m["bpm"]
+
+    # Find songs that need mel computation
+    todo: list[tuple[str, str, float, str]] = []  # (audio_path, hash, bpm, cache_path)
+    for song_hash, audio_path in manifest.items():
+        bpm = bpm_lookup.get(song_hash)
+        if bpm is None:
+            continue
+        cache_path = str(cache_dir / f"{song_hash}_{bpm}.npy")
+        if not Path(cache_path).exists():
+            todo.append((str(audio_path), song_hash, bpm, cache_path))
+
+    if not todo:
+        logger.info("Mel cache is warm: all %d songs already cached", len(manifest))
+        return 0
+
+    logger.info(
+        "Warming mel cache: %d songs to compute (%d already cached)",
+        len(todo), len(manifest) - len(todo),
+    )
+
+    computed = 0
+    import os
+    if max_workers is None:
+        max_workers = min(os.cpu_count() or 4, 8)
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _compute_one_mel, audio_path, song_hash, bpm, cache_path,
+                config.sample_rate, config.n_mels, config.n_fft, config.hop_length,
+                config.use_onset_features,
+            ): song_hash
+            for audio_path, song_hash, bpm, cache_path in todo
+        }
+        for i, future in enumerate(as_completed(futures), 1):
+            result = future.result()
+            if result is not None:
+                computed += 1
+            if i % 500 == 0 or i == len(futures):
+                logger.info("Mel cache progress: %d/%d computed", i, len(futures))
+
+    logger.info("Mel cache warm: %d newly computed", computed)
+    return computed
+
+
+def _split_hashes(
+    hashes: list[str], split: str, seed: int = 42,
+) -> list[str]:
+    """Deterministically split song hashes into train/val/test (80/10/10)."""
+    rng = np.random.RandomState(seed)
+    indices = rng.permutation(len(hashes))
+    n_val = max(1, len(hashes) // 10)
+    n_test = max(1, len(hashes) // 10)
+
+    if split == "train":
+        return [hashes[i] for i in indices[: len(hashes) - n_val - n_test]]
+    elif split == "val":
+        return [hashes[i] for i in indices[len(hashes) - n_val - n_test : len(hashes) - n_test]]
+    elif split == "test":
+        return [hashes[i] for i in indices[len(hashes) - n_test :]]
+    else:
+        raise ValueError(f"Unknown split: {split!r}")
+
+
+def _resolve_sample_bpm_and_notes(
+    song_hash: str,
+    note_dicts: list[dict],
+    timing_lookup: dict[str, dict],
+) -> tuple[float, list[dict], int]:
+    timing = timing_lookup.get(song_hash)
+    if timing is None:
+        bpm = float(note_dicts[0]["bpm"])
+        return bpm, note_dicts, 0
+    bpm = float(timing.get("bpm", 0.0) or 0.0)
+    if bpm <= 0:
+        bpm = float(note_dicts[0]["bpm"])
+        return bpm, note_dicts, 0
+    rebased, dropped = rebase_note_dicts_to_timing(note_dicts, timing_entry=timing)
+    timing["notes_dropped_before_downbeat"] = dropped
+    return bpm, rebased, dropped
+
+
+def _backfill_beatsaver_scores_in_place(
+    metadata: dict[str, dict],
+    audio_manifest: dict[str, str],
+) -> None:
+    """Load BeatSaver scores from raw _beatsaver_meta.json files."""
+    needs_backfill = any(
+        m.get("source") == "beatsaver" and m.get("score") is None
+        for m in metadata.values()
+    )
+    if not needs_backfill:
+        return
+
+    filled = 0
+    for song_hash, meta in metadata.items():
+        if meta.get("source") != "beatsaver" or meta.get("score") is not None:
+            continue
+        audio_path = audio_manifest.get(song_hash)
+        if audio_path is None:
+            continue
+        meta_path = Path(audio_path).parent / "_beatsaver_meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            bs_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            stats = bs_meta.get("stats", {})
+            score = stats.get("score")
+            if score is not None:
+                meta["score"] = score
+                filled += 1
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    if filled > 0:
+        logger.info("Back-filled BeatSaver scores for %d songs from raw metadata", filled)
+
+
+def _dataset_cache_key(
+    processed_dir: Path,
+    audio_manifest_path: Path,
+    config: ModelConfig,
+    include_splits: tuple[str, ...],
+) -> str:
+    """Hash the inputs that affect prepared sample contents."""
+    processed_dir = Path(processed_dir)
+    manifest_path = Path(audio_manifest_path)
+    digest = hashlib.sha256()
+    digest.update(_DATASET_CACHE_VERSION.encode())
+
+    config_state = {
+        "max_seq_len": config.max_seq_len,
+        "min_difficulty": config.min_difficulty,
+        "characteristics": config.characteristics,
+        "min_bpm": config.min_bpm,
+        "max_bpm": config.max_bpm,
+        "splits": include_splits,
+        "encoder_type": config.encoder_type,
+        "max_audio_duration": config.max_audio_duration,
+    }
+    digest.update(json.dumps(config_state, sort_keys=True).encode("utf-8"))
+
+    paths = [
+        processed_dir / "metadata.json",
+        processed_dir / "timing_metadata.json",
+        *sorted(processed_dir.glob("notes_*.parquet")),
+    ]
+    legacy_path = processed_dir / "notes.parquet"
+    if legacy_path.exists():
+        paths.append(legacy_path)
+    if manifest_path.exists():
+        paths.append(manifest_path)
+
+    for path in paths:
+        stat = path.stat()
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(str(stat.st_size).encode("utf-8"))
+        digest.update(str(stat.st_mtime_ns).encode("utf-8"))
+
+    cache_dir = _resolve_feature_cache_dir(processed_dir, config)
+    version_path = cache_dir / "VERSION"
+    if version_path.exists():
+        version_stat = version_path.stat()
+        digest.update(str(version_path.resolve()).encode("utf-8"))
+        digest.update(str(version_stat.st_size).encode("utf-8"))
+        digest.update(str(version_stat.st_mtime_ns).encode("utf-8"))
+        digest.update(version_path.read_text(encoding="utf-8").strip().encode("utf-8"))
+
+    cache_files = list(cache_dir.glob("*.npy")) if cache_dir.exists() else []
+    digest.update(str(len(cache_files)).encode("utf-8"))
+    if cache_files:
+        newest_mtime = max(file.stat().st_mtime_ns for file in cache_files)
+        digest.update(str(newest_mtime).encode("utf-8"))
+
+    return digest.hexdigest()[:16]
+
+
+def _dataset_cache_path(
+    processed_dir: Path,
+    audio_manifest_path: Path,
+    config: ModelConfig,
+    include_splits: tuple[str, ...],
+) -> Path:
+    cache_dir = Path(processed_dir) / "dataset_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _dataset_cache_key(processed_dir, audio_manifest_path, config, include_splits)
+    return cache_dir / f"prepared_{key}.pkl"
+
+
+def _load_cached_dataset_corpus(cache_path: Path) -> _PreparedDatasetCorpus | None:
+    try:
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
+    except (OSError, pickle.PickleError, EOFError, AttributeError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return _PreparedDatasetCorpus(
+            audio_manifest=payload["audio_manifest"],
+            metadata=payload["metadata"],
+            timing=payload.get("timing", {}),
+            mel_cache_dir=Path(payload["mel_cache_dir"]),
+            samples=payload["samples"],
+            split_hashes={k: set(v) for k, v in payload["split_hashes"].items()},
+        )
+    except KeyError:
+        return None
+
+
+def _save_cached_dataset_corpus(cache_path: Path, corpus: _PreparedDatasetCorpus) -> None:
+    payload = {
+        "audio_manifest": corpus.audio_manifest,
+        "metadata": corpus.metadata,
+        "timing": corpus.timing,
+        "mel_cache_dir": str(corpus.mel_cache_dir),
+        "samples": corpus.samples,
+        "split_hashes": {k: sorted(v) for k, v in corpus.split_hashes.items()},
+    }
+    with open(cache_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _build_sample_beatmap(
+    sample: dict,
+    metadata: dict[str, dict],
+    notes: list[Note],
+) -> NormalizedBeatmap:
+    meta = metadata.get(sample["song_hash"], {})
+    return NormalizedBeatmap(
+        metadata=SongMetadata(
+            source=meta.get("source", "unknown"),
+            source_id=meta.get("source_id", sample["song_hash"]),
+            hash=sample["song_hash"],
+            bpm=sample["bpm"],
+        ),
+        difficulty_info=DifficultyInfo(
+            characteristic=sample["characteristic"],
+            difficulty=sample["difficulty"],
+            difficulty_rank=0,
+            note_jump_speed=0.0,
+            note_jump_offset=0.0,
+        ),
+        notes=notes,
+    )
+
+
+def _pad_token_sequence(token_ids: list[int], max_len: int) -> tuple[list[int], list[bool]]:
+    if len(token_ids) > max_len:
+        token_ids = token_ids[:max_len]
+    mask = [True] * len(token_ids) + [False] * (max_len - len(token_ids))
+    token_ids = token_ids + [0] * (max_len - len(token_ids))
+    return token_ids, mask
+
+
+def _select_window_start(total_frames: int, window_frames: int, split: str) -> int:
+    """Choose a bar-aligned window start in beat-grid frames."""
+    if total_frames <= window_frames:
+        return 0
+    max_start = total_frames - window_frames
+    bar_aligned_max = (max_start // _SUBDIVISIONS_PER_BAR) * _SUBDIVISIONS_PER_BAR
+    if split != "train" or bar_aligned_max <= 0:
+        return 0
+    num_positions = (bar_aligned_max // _SUBDIVISIONS_PER_BAR) + 1
+    return int(np.random.randint(0, num_positions)) * _SUBDIVISIONS_PER_BAR
+
+
+def _slice_notes_to_window(
+    note_dicts: list[dict],
+    *,
+    start_frame: int,
+    end_frame: int,
+    bpm: float,
+) -> list[Note]:
+    """Crop notes to a beat-grid frame window and shift them to local beats."""
+    start_beat = start_frame / _SUBDIVISIONS_PER_BEAT
+    end_beat = end_frame / _SUBDIVISIONS_PER_BEAT
+    sliced: list[Note] = []
+    for n in note_dicts:
+        beat = n["beat"]
+        if not (start_beat <= beat < end_beat):
+            continue
+        local_beat = beat - start_beat
+        sliced.append(
+            Note(
+                beat=local_beat,
+                time_seconds=local_beat * 60.0 / bpm,
+                x=n["x"],
+                y=n["y"],
+                color=n["color"],
+                cut_direction=n["cut_direction"],
+                angle_offset=n.get("angle_offset", 0),
+            )
+        )
+    return sliced
+
+
+def _pretokenize_shared_samples(
+    samples: list[dict],
+    metadata: dict[str, dict],
+    config: ModelConfig,
+) -> list[dict]:
+    skipped_samples = 0
+    for sample in samples:
+        notes = [
+            Note(
+                beat=n["beat"],
+                time_seconds=n["time_seconds"],
+                x=n["x"],
+                y=n["y"],
+                color=n["color"],
+                cut_direction=n["cut_direction"],
+                angle_offset=n.get("angle_offset", 0),
+            )
+            for n in sample["notes"]
+            if 0 <= n["x"] < 4 and 0 <= n["y"] < 3
+            and 0 <= n["cut_direction"] < 9 and n["color"] in (0, 1)
+        ]
+        if not notes:
+            skipped_samples += 1
+            sample["_skip"] = True
+            continue
+        sample["notes"] = [
+            {
+                "beat": note.beat,
+                "time_seconds": note.time_seconds,
+                "x": note.x,
+                "y": note.y,
+                "color": note.color,
+                "cut_direction": note.cut_direction,
+                "angle_offset": note.angle_offset,
+            }
+            for note in notes
+        ]
+        beatmap = _build_sample_beatmap(sample, metadata, notes)
+        token_ids = encode_beatmap(beatmap)
+        sample["full_token_count"] = len(token_ids)
+        token_ids, mask = _pad_token_sequence(token_ids, config.max_seq_len)
+        sample["token_ids"] = token_ids
+        sample["token_mask"] = mask
+
+    if skipped_samples > 0:
+        samples = [s for s in samples if not s.get("_skip")]
+        logger.warning(
+            "Filtered out %d samples with no standard-grid notes", skipped_samples,
+        )
+
+    return samples
+
+
+def prepare_dataset_corpus(
+    processed_dir: Path,
+    audio_manifest_path: Path,
+    config: ModelConfig,
+    include_splits: tuple[str, ...] = ("train", "val", "test"),
+) -> _PreparedDatasetCorpus:
+    """Prepare dataset state once so multiple splits can share it."""
+    prepared_cache_path = _dataset_cache_path(
+        processed_dir, audio_manifest_path, config, include_splits,
+    )
+    cached = _load_cached_dataset_corpus(prepared_cache_path)
+    if cached is not None:
+        logger.info("Prepared dataset cache hit: %s", prepared_cache_path)
+        return cached
+    logger.info("Prepared dataset cache miss: %s", prepared_cache_path)
+
+    processed_dir = Path(processed_dir)
+    audio_manifest = load_manifest(audio_manifest_path)
+    metadata = load_metadata_dict(processed_dir)
+    timing_lookup = load_timing_metadata(processed_dir, metadata=metadata)
+    _backfill_beatsaver_scores_in_place(metadata, audio_manifest)
+
+    mel_cache_dir = _resolve_feature_cache_dir(processed_dir, config)
+    mel_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    table = read_notes_parquet(processed_dir)
+    df = table.to_pandas()
+    if "angle_offset" not in df.columns:
+        df["angle_offset"] = 0
+
+    note_cols = ["beat", "time_seconds", "x", "y", "color",
+                 "cut_direction", "angle_offset", "bpm"]
+    grouped = df.groupby(["song_hash", "difficulty", "characteristic"])
+    all_hashes = sorted(df["song_hash"].unique())
+    split_hashes = {
+        name: set(_split_hashes(all_hashes, name))
+        for name in include_splits
+    }
+    allowed_hashes = set().union(*split_hashes.values()) if split_hashes else set()
+
+    min_diff_rank = BeatSaberDataset._DIFF_RANK.get(config.min_difficulty, 1)
+    allowed_chars = set(config.characteristics) if config.characteristics else None
+    filtered_counts = {"difficulty": 0, "characteristic": 0, "bpm": 0, "audio": 0, "duration": 0}
+    audio_ok: dict[str, bool] = {}
+    samples: list[dict] = []
+    max_dur = config.max_audio_duration
+
+    for (song_hash, difficulty, characteristic), group in grouped:
+        if song_hash not in allowed_hashes:
+            continue
+        if song_hash not in audio_manifest:
+            continue
+        if BeatSaberDataset._DIFF_RANK.get(difficulty, 0) < min_diff_rank:
+            filtered_counts["difficulty"] += 1
+            continue
+        if allowed_chars and characteristic not in allowed_chars:
+            filtered_counts["characteristic"] += 1
+            continue
+        note_dicts = group[note_cols].to_dict("records")
+        bpm, note_dicts, dropped_before_downbeat = _resolve_sample_bpm_and_notes(
+            song_hash, note_dicts, timing_lookup,
+        )
+        if bpm < config.min_bpm or bpm > config.max_bpm:
+            filtered_counts["bpm"] += 1
+            continue
+        if config.encoder_type in _MUQ_ENCODER_TYPES:
+            mel_path = mel_cache_dir / f"{song_hash}.npy"
+        else:
+            mel_path = mel_cache_dir / f"{song_hash}_{bpm}.npy"
+        # Duration filter: check cached feature length as proxy for audio duration
+        if max_dur > 0 and mel_path.exists():
+            if song_hash not in audio_ok:
+                cached = np.load(mel_path)
+                if config.encoder_type in _MUQ_ENCODER_TYPES:
+                    if _is_beatgrid_muq_cache(mel_cache_dir):
+                        subs_per_second = (bpm / 60.0) * 16
+                        cached_duration = cached.shape[1] / subs_per_second if subs_per_second > 0 else 0
+                    else:
+                        cached_duration = max(
+                            0.0,
+                            (cached.shape[0] / 25.0) - float(timing_lookup.get(song_hash, {}).get("first_downbeat_sec", 0.0) or 0.0),
+                        )
+                else:
+                    subs_per_second = (bpm / 60.0) * 16
+                    cached_duration = cached.shape[1] / subs_per_second if subs_per_second > 0 else 0
+                if cached_duration > max_dur:
+                    audio_ok[song_hash] = False
+                    filtered_counts["duration"] += 1
+                else:
+                    audio_ok[song_hash] = True
+            if not audio_ok.get(song_hash, True):
+                continue
+        if not mel_path.exists():
+            # MuQ features must be pre-cached; skip uncached songs
+            if config.encoder_type in _MUQ_ENCODER_TYPES:
+                if song_hash not in audio_ok:
+                    audio_ok[song_hash] = False
+                    filtered_counts["audio"] += 1
+                continue
+            is_decodable = audio_ok.get(song_hash)
+            if is_decodable is None:
+                audio_path = audio_manifest[song_hash]
+                try:
+                    audio_data, _ = load_audio(Path(audio_path), sr=config.sample_rate)
+                    duration = len(audio_data) / config.sample_rate
+                    if max_dur > 0 and duration > max_dur:
+                        is_decodable = False
+                        filtered_counts["duration"] += 1
+                    else:
+                        is_decodable = True
+                except Exception as e:
+                    logger.warning(
+                        "Filtering out song %s: failed to decode %s: %s",
+                        song_hash, audio_path, e,
+                    )
+                    is_decodable = False
+                audio_ok[song_hash] = is_decodable
+            if not is_decodable:
+                filtered_counts["audio"] += 1
+                continue
+        meta = metadata.get(song_hash, {})
+        timing = timing_lookup.get(song_hash, {})
+        samples.append({
+            "song_hash": song_hash,
+            "difficulty": difficulty,
+            "characteristic": characteristic,
+            "notes": note_dicts,
+            "bpm": bpm,
+            "beat_offset_seconds": float(timing.get("first_downbeat_sec", 0.0) or 0.0),
+            "timing_source": timing.get("timing_source", "metadata_bpm_only"),
+            "timing_confidence": timing.get("timing_confidence", "unknown"),
+            "timing_needs_review": bool(timing.get("needs_review", False)),
+            "notes_dropped_before_downbeat": dropped_before_downbeat,
+            "source": meta.get("source", "unknown"),
+            "score": meta.get("score"),
+        })
+
+    for reason, count in filtered_counts.items():
+        if count > 0:
+            logger.info("Filtered %d samples by %s", count, reason)
+
+    del df, table, grouped
+    samples = _pretokenize_shared_samples(samples, metadata, config)
+
+    corpus = _PreparedDatasetCorpus(
+        audio_manifest=audio_manifest,
+        metadata=metadata,
+        timing=timing_lookup,
+        mel_cache_dir=mel_cache_dir,
+        samples=samples,
+        split_hashes=split_hashes,
+    )
+    try:
+        _save_cached_dataset_corpus(prepared_cache_path, corpus)
+    except OSError as e:
+        logger.warning(
+            "Failed to write prepared dataset cache %s: %s", prepared_cache_path, e,
+        )
+    return corpus
+
+
+def _dataset_from_prepared_corpus(
+    processed_dir: Path,
+    config: ModelConfig,
+    split: str,
+    prepared_corpus: _PreparedDatasetCorpus,
+) -> "BeatSaberDataset":
+    dataset = BeatSaberDataset.__new__(BeatSaberDataset)
+    dataset.config = config
+    dataset.split = split
+    dataset.processed_dir = Path(processed_dir)
+    dataset.audio_manifest = prepared_corpus.audio_manifest
+    dataset.metadata = prepared_corpus.metadata
+    dataset.timing = prepared_corpus.timing
+    dataset.mel_cache_dir = prepared_corpus.mel_cache_dir
+    split_hashes = prepared_corpus.split_hashes[split]
+    dataset.samples = [
+        sample for sample in prepared_corpus.samples
+        if sample["song_hash"] in split_hashes
+    ]
+    logger.info(
+        "BeatSaberDataset(%s): %d samples from %d songs",
+        split, len(dataset.samples), len(split_hashes),
+    )
+    return dataset
+
+
+def build_train_val_datasets(
+    processed_dir: Path,
+    audio_manifest_path: Path,
+    config: ModelConfig,
+) -> tuple["BeatSaberDataset", "BeatSaberDataset"]:
+    """Build train/val datasets while sharing the expensive setup path."""
+    prepared = prepare_dataset_corpus(
+        processed_dir, audio_manifest_path, config, include_splits=("train", "val"),
+    )
+    return (
+        _dataset_from_prepared_corpus(processed_dir, config, "train", prepared),
+        _dataset_from_prepared_corpus(processed_dir, config, "val", prepared),
+    )
+
+
+class BeatSaberDataset(Dataset):
+    """Dataset that loads Parquet note data + audio for training.
+
+    Each item is one (song_hash, difficulty, characteristic) combination.
+    Returns (mel_spectrogram, token_ids, token_mask) tensors.
+    """
+
+    # Difficulty rank for filtering (matches DifficultyInfo.difficulty_rank)
+    _DIFF_RANK = {
+        "Easy": 1, "Normal": 3, "Hard": 5, "Expert": 7, "ExpertPlus": 9,
+    }
+
+    def __init__(
+        self,
+        processed_dir: Path,
+        audio_manifest_path: Path,
+        config: ModelConfig,
+        split: str = "train",
+    ) -> None:
+        self.config = config
+        self.split = split
+        self.processed_dir = Path(processed_dir)
+        self.audio_manifest = load_manifest(audio_manifest_path)
+
+        # Load metadata (writer produces a list; convert to dict keyed by hash)
+        self.metadata = load_metadata_dict(self.processed_dir)
+        self.timing = load_timing_metadata(self.processed_dir, metadata=self.metadata)
+
+        # Back-fill BeatSaver scores from raw _beatsaver_meta.json files
+        # when metadata.json was generated before score injection existed.
+        self._backfill_beatsaver_scores()
+
+        # Feature cache directory (mel or muq)
+        self.mel_cache_dir = _resolve_feature_cache_dir(self.processed_dir, config)
+        self.mel_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load notes from Parquet using pandas groupby (vectorized)
+        table = read_notes_parquet(self.processed_dir)
+        df = table.to_pandas()
+
+        # Ensure angle_offset column exists
+        if "angle_offset" not in df.columns:
+            df["angle_offset"] = 0
+
+        # Group notes by (song_hash, difficulty, characteristic)
+        self.samples: list[dict] = []
+        note_cols = ["beat", "time_seconds", "x", "y", "color",
+                     "cut_direction", "angle_offset", "bpm"]
+        grouped = df.groupby(["song_hash", "difficulty", "characteristic"])
+
+        # Collect all unique hashes for splitting
+        all_hashes = sorted(df["song_hash"].unique())
+        split_hashes = set(_split_hashes(all_hashes, split))
+
+        # Prepare filtering thresholds from config
+        min_diff_rank = self._DIFF_RANK.get(config.min_difficulty, 1)
+        allowed_chars = set(config.characteristics) if config.characteristics else None
+        filtered_counts = {"difficulty": 0, "characteristic": 0, "bpm": 0, "audio": 0}
+        audio_ok: dict[str, bool] = {}
+
+        for (song_hash, difficulty, characteristic), group in grouped:
+            if song_hash not in split_hashes:
+                continue
+            if song_hash not in self.audio_manifest:
+                continue
+            # Apply config-driven filters
+            if self._DIFF_RANK.get(difficulty, 0) < min_diff_rank:
+                filtered_counts["difficulty"] += 1
+                continue
+            if allowed_chars and characteristic not in allowed_chars:
+                filtered_counts["characteristic"] += 1
+                continue
+            note_dicts = group[note_cols].to_dict("records")
+            bpm, note_dicts, dropped_before_downbeat = _resolve_sample_bpm_and_notes(
+                song_hash, note_dicts, self.timing,
+            )
+            if bpm < config.min_bpm or bpm > config.max_bpm:
+                filtered_counts["bpm"] += 1
+                continue
+            if self.config.encoder_type in _MUQ_ENCODER_TYPES:
+                cache_path = self.mel_cache_dir / f"{song_hash}.npy"
+            else:
+                cache_path = self.mel_cache_dir / f"{song_hash}_{bpm}.npy"
+            if not cache_path.exists():
+                # MuQ features must be pre-cached; skip uncached songs
+                if self.config.encoder_type in _MUQ_ENCODER_TYPES:
+                    if song_hash not in audio_ok:
+                        audio_ok[song_hash] = False
+                        filtered_counts["audio"] += 1
+                    continue
+                is_decodable = audio_ok.get(song_hash)
+                if is_decodable is None:
+                    audio_path = self.audio_manifest[song_hash]
+                    try:
+                        load_audio(Path(audio_path), sr=self.config.sample_rate)
+                        is_decodable = True
+                    except Exception as e:
+                        logger.warning(
+                            "Filtering out song %s: failed to decode %s: %s",
+                            song_hash, audio_path, e,
+                        )
+                        is_decodable = False
+                    audio_ok[song_hash] = is_decodable
+                if not is_decodable:
+                    filtered_counts["audio"] += 1
+                    continue
+            meta = self.metadata.get(song_hash, {})
+            timing = self.timing.get(song_hash, {})
+            self.samples.append({
+                "song_hash": song_hash,
+                "difficulty": difficulty,
+                "characteristic": characteristic,
+                "notes": note_dicts,
+                "bpm": bpm,
+                "beat_offset_seconds": float(timing.get("first_downbeat_sec", 0.0) or 0.0),
+                "timing_source": timing.get("timing_source", "metadata_bpm_only"),
+                "timing_confidence": timing.get("timing_confidence", "unknown"),
+                "timing_needs_review": bool(timing.get("needs_review", False)),
+                "notes_dropped_before_downbeat": dropped_before_downbeat,
+                "source": meta.get("source", "unknown"),
+                "score": meta.get("score"),
+            })
+
+        for reason, count in filtered_counts.items():
+            if count > 0:
+                logger.info("Filtered %d samples by %s", count, reason)
+
+        # Free the large DataFrame and Arrow table now that samples are built
+        del df, table, grouped
+
+        # Pre-tokenize all samples (deterministic 鈥?no need to repeat per epoch)
+        skipped_samples = 0
+        for sample in self.samples:
+            # Filter out notes with coordinates outside the standard 4x3 grid
+            # (mapping extension maps can have x=1000, y=3000, etc.)
+            notes = [
+                Note(
+                    beat=n["beat"],
+                    time_seconds=n["time_seconds"],
+                    x=n["x"],
+                    y=n["y"],
+                    color=n["color"],
+                    cut_direction=n["cut_direction"],
+                    angle_offset=n.get("angle_offset", 0),
+                )
+                for n in sample["notes"]
+                if 0 <= n["x"] < 4 and 0 <= n["y"] < 3
+                and 0 <= n["cut_direction"] < 9 and n["color"] in (0, 1)
+            ]
+            if not notes:
+                skipped_samples += 1
+                sample["_skip"] = True
+                continue
+            sample["notes"] = [
+                {
+                    "beat": note.beat,
+                    "time_seconds": note.time_seconds,
+                    "x": note.x,
+                    "y": note.y,
+                    "color": note.color,
+                    "cut_direction": note.cut_direction,
+                    "angle_offset": note.angle_offset,
+                }
+                for note in notes
+            ]
+            beatmap = _build_sample_beatmap(sample, self.metadata, notes)
+            token_ids = encode_beatmap(beatmap)
+
+            sample["full_token_count"] = len(token_ids)
+            token_ids, mask = _pad_token_sequence(token_ids, self.config.max_seq_len)
+            sample["token_ids"] = token_ids
+            sample["token_mask"] = mask
+
+        # Remove samples that had no valid notes after filtering
+        if skipped_samples > 0:
+            self.samples = [s for s in self.samples if not s.get("_skip")]
+            logger.warning(
+                "Filtered out %d samples with no standard-grid notes", skipped_samples,
+            )
+
+        logger.info(
+            "BeatSaberDataset(%s): %d samples from %d songs",
+            split, len(self.samples), len(split_hashes),
+        )
+
+    def _backfill_beatsaver_scores(self) -> None:
+        """Load BeatSaver scores from raw _beatsaver_meta.json files.
+
+        When metadata.json was generated before score injection existed,
+        all beatsaver scores will be None. This method reads scores from
+        the original _beatsaver_meta.json files (located next to audio files
+        referenced in the audio manifest) and patches the in-memory metadata.
+        """
+        # Check if any beatsaver entries are missing scores
+        needs_backfill = any(
+            m.get("source") == "beatsaver" and m.get("score") is None
+            for m in self.metadata.values()
+        )
+        if not needs_backfill:
+            return
+
+        filled = 0
+        for song_hash, meta in self.metadata.items():
+            if meta.get("source") != "beatsaver" or meta.get("score") is not None:
+                continue
+            audio_path = self.audio_manifest.get(song_hash)
+            if audio_path is None:
+                continue
+            meta_path = Path(audio_path).parent / "_beatsaver_meta.json"
+            if not meta_path.exists():
+                continue
+            try:
+                bs_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                stats = bs_meta.get("stats", {})
+                score = stats.get("score")
+                if score is not None:
+                    meta["score"] = score
+                    filled += 1
+            except (json.JSONDecodeError, OSError):
+                continue
+
+        if filled > 0:
+            logger.info("Back-filled BeatSaver scores for %d songs from raw metadata", filled)
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def load_full_features(self, idx: int) -> np.ndarray:
+        """Load full cached features for a sample without training-time cropping."""
+        sample = self.samples[idx]
+        song_hash = sample["song_hash"]
+        bpm = sample["bpm"]
+        beat_offset_seconds = float(sample.get("beat_offset_seconds", 0.0) or 0.0)
+
+        # Load features from cache (mel or MuQ)
+        if self.config.encoder_type in _MUQ_ENCODER_TYPES:
+            cache_path = self.mel_cache_dir / f"{song_hash}.npy"
+        else:
+            cache_path = self.mel_cache_dir / f"{song_hash}_{bpm}.npy"
+        if cache_path.exists():
+            mel = np.load(cache_path)
+            # Raw MuQ features are (T_muq, 1024) at 25 Hz 鈥?interpolate to beat grid
+            if self.config.encoder_type in _MUQ_ENCODER_TYPES:
+                if not _is_beatgrid_muq_cache(self.mel_cache_dir):
+                    mel = interpolate_muq_to_beat_grid(
+                        mel,
+                        bpm,
+                        beat_offset_seconds=beat_offset_seconds,
+                    )
+        elif self.config.encoder_type in _MUQ_ENCODER_TYPES:
+            raise FileNotFoundError(
+                f"MuQ cache missing for {song_hash}. Run cache_muq_subset.py or build the beatgrid cache first."
+            )
+        else:
+            audio_path = self.audio_manifest[song_hash]
+            audio, sr = load_audio(Path(audio_path), sr=self.config.sample_rate)
+            if self.config.use_onset_features:
+                mel = compute_mel_with_onset(
+                    audio, sr=sr,
+                    n_mels=self.config.n_mels,
+                    n_fft=self.config.n_fft,
+                    hop_length=self.config.hop_length,
+                )
+            else:
+                mel = compute_mel_spectrogram(
+                    audio, sr=sr,
+                    n_mels=self.config.n_mels,
+                    n_fft=self.config.n_fft,
+                    hop_length=self.config.hop_length,
+                )
+            mel = beat_align_spectrogram(
+                mel, sr=sr, hop_length=self.config.hop_length, bpm=bpm,
+            )
+            np.save(cache_path, mel)
+        return mel
+
+    def reference_notes(self, idx: int) -> list[Note]:
+        """Return the full-song reference notes for a sample."""
+        sample = self.samples[idx]
+        bpm = sample["bpm"]
+        return sorted(
+            [
+                Note(
+                    beat=note["beat"],
+                    time_seconds=note.get("time_seconds", note["beat"] * 60.0 / bpm),
+                    x=note["x"],
+                    y=note["y"],
+                    color=note["color"],
+                    cut_direction=note["cut_direction"],
+                    angle_offset=note.get("angle_offset", 0),
+                )
+                for note in sample["notes"]
+            ],
+            key=lambda note: (note.beat, note.color, note.x, note.y),
+        )
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sample = self.samples[idx]
+        bpm = sample["bpm"]
+
+        # Use pre-computed tokens
+        token_ids = sample["token_ids"]
+        mask = sample["token_mask"]
+
+        mel = self.load_full_features(idx)
+
+        # Truncate audio to max_audio_len to fit in VRAM
+        start_frame = _select_window_start(mel.shape[1], self.config.max_audio_len, self.split)
+        end_frame = min(mel.shape[1], start_frame + self.config.max_audio_len)
+        if start_frame > 0 or end_frame < mel.shape[1]:
+            mel = mel[:, start_frame:end_frame]
+            notes = _slice_notes_to_window(
+                sample["notes"],
+                start_frame=start_frame,
+                end_frame=end_frame,
+                bpm=bpm,
+            )
+            token_ids, mask = _pad_token_sequence(
+                encode_beatmap(_build_sample_beatmap(sample, self.metadata, notes)),
+                self.config.max_seq_len,
+            )
+
+        # SpecAugment: random time/frequency masking (training only, mel features only)
+        if self.split == "train" and self.config.encoder_type not in _MUQ_ENCODER_TYPES:
+            mel = self._spec_augment(mel)
+
+        return (
+            torch.from_numpy(mel),                          # (n_mels, T_audio)
+            torch.tensor(token_ids, dtype=torch.long),      # (max_seq_len,)
+            torch.tensor(mask, dtype=torch.bool),           # (max_seq_len,)
+        )
+
+    @staticmethod
+    def _spec_augment(mel: np.ndarray) -> np.ndarray:
+        """Apply SpecAugment: random time and frequency masking.
+
+        Time mask width scales with sequence length so the masking fraction
+        stays meaningful for long sequences (e.g. 4096 frames).
+        """
+        mel = mel.copy()  # Don't mutate cached data
+        n_mels, n_frames = mel.shape
+        if n_frames == 0:
+            return mel
+        # Frequency masking: 2 bands, width up to 10 bins
+        for _ in range(2):
+            f = np.random.randint(1, min(11, n_mels))
+            f0 = np.random.randint(0, n_mels - f + 1)
+            mel[f0:f0 + f, :] = 0.0
+        # Time masking: scale width with sequence length (~2% of frames, min 20, max 100)
+        max_t = max(20, min(100, n_frames // 50))
+        for _ in range(2):
+            t = np.random.randint(1, min(max_t + 1, n_frames))
+            t0 = np.random.randint(0, n_frames - t + 1)
+            mel[:, t0:t0 + t] = 0.0
+        return mel
+
+
+def collate_fn(
+    batch: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collate batch, padding mel spectrograms to the longest in the batch.
+
+    Returns (mel, mel_mask, tokens, token_mask).
+    """
+    mels, tokens, masks = zip(*batch)
+
+    # Pad mel spectrograms to max length in batch
+    max_mel_len = max(m.shape[1] for m in mels)
+    n_mels = mels[0].shape[0]
+
+    mel_padded = torch.zeros(len(mels), n_mels, max_mel_len)
+    mel_mask = torch.zeros(len(mels), max_mel_len, dtype=torch.bool)
+    for i, m in enumerate(mels):
+        length = m.shape[1]
+        mel_padded[i, :, :length] = m
+        mel_mask[i, :length] = True
+
+    tokens_stacked = torch.stack(tokens)
+    masks_stacked = torch.stack(masks)
+
+    return mel_padded, mel_mask, tokens_stacked, masks_stacked
+
+
+def build_weighted_sampler(
+    dataset: BeatSaberDataset, official_ratio: float = 0.2,
+) -> WeightedRandomSampler | None:
+    """Build a WeightedRandomSampler that oversamples official maps.
+
+    Official maps are weighted to fill ``official_ratio`` of each batch.
+    Custom maps are weighted by their BeatSaver score (higher-rated maps
+    sampled more often).
+
+    Returns ``None`` if all samples come from a single source (no
+    rebalancing needed).
+    """
+    official_indices = []
+    custom_indices = []
+    custom_scores: list[float] = []
+
+    for i, sample in enumerate(dataset.samples):
+        if sample["source"] == "official":
+            official_indices.append(i)
+        else:
+            custom_indices.append(i)
+            # Default to 1.0 if score is missing
+            custom_scores.append(sample.get("score") or 1.0)
+
+    n_official = len(official_indices)
+    n_custom = len(custom_indices)
+
+    # No rebalancing needed if only one source present
+    if n_official == 0 or n_custom == 0:
+        return None
+
+    # Compute weights so official samples collectively account for
+    # ``official_ratio`` of the total sampling probability:
+    #   sum(w_official) / (sum(w_official) + sum(w_custom)) = official_ratio
+    # Within custom maps, weight by score.
+    sum_custom_scores = sum(custom_scores)
+    w_official = (official_ratio * sum_custom_scores) / (n_official * (1.0 - official_ratio))
+
+    weights = [0.0] * len(dataset)
+    for i in official_indices:
+        weights[i] = w_official
+    for i, idx in enumerate(custom_indices):
+        weights[idx] = custom_scores[i]
+
+    logger.info(
+        "Weighted sampler: %d official (w=%.4f), %d custom (mean_score=%.4f), "
+        "target official_ratio=%.0f%%",
+        n_official, w_official, n_custom,
+        sum_custom_scores / n_custom, official_ratio * 100,
+    )
+
+    return WeightedRandomSampler(
+        weights=weights,
+        num_samples=len(dataset),
+        replacement=True,
+    )
+
+
