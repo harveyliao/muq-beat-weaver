@@ -117,6 +117,22 @@ Install dependencies from the repo root:
 uv sync
 ```
 
+### Pretrained output weights
+
+If you want to run inference with the trained checkpoints used in this project, download the pretrained `output.zip` archive into the `output/` folder at the project root:
+
+- Google Drive: [output.zip](https://drive.google.com/file/d/12PRc-fVwcnO1A5U5kR6vfw-jmlQM4am4/view?usp=drive_link)
+- Access note: shared with anyone who has the link and in the Ontario Tech University organization
+
+Instructions:
+
+1. Download `output.zip` into `output/` under the project root.
+2. Unzip `output.zip` inside `output/`.
+3. After extraction, you should see these 3 items in `output/`:
+   - `muq_precomputed_2000_45ep_base_bs8/`
+   - `muq_precomputed_beatsaver_x3_base_bs8/`
+   - `audit_training_targets.json`
+
 Optional developer checks:
 
 ```powershell
