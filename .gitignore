@@ -11,9 +11,9 @@ muq_beat_weaver.egg-info/
 __pycache__/
 *.py[cod]
 
-data/
-output/
-research/
+# data/
+# output/
+# research/
 
 .DS_Store
 Thumbs.db
