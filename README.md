@@ -9,6 +9,7 @@ This repo is not the full data ingestion pipeline by itself. It works together w
 - MuQ upstream model/code: [tencent-ailab/MuQ](https://github.com/tencent-ailab/MuQ)
 - Original Beat Weaver project: [asfilion/beat-weaver](https://github.com/asfilion/beat-weaver)
 - Data-preparation fork used for this project: [harveyliao/beat-weaver](https://github.com/harveyliao/beat-weaver)
+  - [related section](https://github.com/harveyliao/beat-weaver#prepare-data-here-train-in-muq-beat-weaver)
 
 In this project:
 
@@ -218,10 +219,7 @@ Current limitations:
 
 ## Demo Media
 
-This section is included to satisfy the course repository requirements.
-
-- Screenshot(s): add generated-map screenshots here before final submission
-- Video demo: add the public YouTube link here before final submission
+- [Video demo](https://drive.google.com/file/d/1USi5dRjUZ6W1N_6yTpE5NGEMMfjElXZE/view?usp=drive_link)
 
 ## References
 
