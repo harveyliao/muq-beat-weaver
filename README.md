@@ -4,6 +4,8 @@
 
 This repo is not the full data ingestion pipeline by itself. It works together with a sibling `beat-weaver` repository that prepares raw Beat Saber datasets into the processed corpus used here for training.
 
+For transparency on AI-assisted development in this course project, see [docs/ai-usage.md](docs/ai-usage.md).
+
 ## Repository Lineage And Attribution
 
 - MuQ upstream model/code: [tencent-ailab/MuQ](https://github.com/tencent-ailab/MuQ)
