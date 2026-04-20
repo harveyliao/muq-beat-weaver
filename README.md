@@ -6,7 +6,7 @@ This repo is not the full data ingestion pipeline by itself. It works together w
 
 ## Repository Lineage And Attribution
 
-- MuQ upstream model/code: [tencent-ailab/MuQ](git@github.com:tencent-ailab/MuQ.git)
+- MuQ upstream model/code: [tencent-ailab/MuQ](https://github.com/tencent-ailab/MuQ)
 - Original Beat Weaver project: [asfilion/beat-weaver](https://github.com/asfilion/beat-weaver)
 - Data-preparation fork used for this project: [harveyliao/beat-weaver](https://github.com/harveyliao/beat-weaver)
 
@@ -225,7 +225,7 @@ This section is included to satisfy the course repository requirements.
 
 ## References
 
-- MuQ repository: [git@github.com:tencent-ailab/MuQ.git](git@github.com:tencent-ailab/MuQ.git)
+- MuQ repository: [https://github.com/tencent-ailab/MuQ](https://github.com/tencent-ailab/MuQ)
 - Original Beat Weaver repository: [https://github.com/asfilion/beat-weaver](https://github.com/asfilion/beat-weaver)
 - Data-prep fork used by this project: [https://github.com/harveyliao/beat-weaver](https://github.com/harveyliao/beat-weaver)
 - Local project analysis: [research/research.md](research/research.md)
